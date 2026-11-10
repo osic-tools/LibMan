@@ -241,7 +241,8 @@ QString layoutRectPythonCode(const QString &roomPath,
                              const TechLayer &layer,
                              const LayoutRectEdit &edit)
 {
-    const QString path = pythonString(QDir::fromNativeSeparators(roomPath));
+    // Forward slashes on every host: the snippet must stay copy-pasteable from Windows paths.
+    const QString path = pythonString(QString(roomPath).replace(QLatin1Char('\\'), QLatin1Char('/')));
     QStringList lines;
     lines << QStringLiteral("import room");
     lines << (edit.createdFile ? QStringLiteral("db = room.create()")
