@@ -36,6 +36,7 @@ SOURCES += \
     oas/oasReader.cpp \
     src/klayout_tools.cpp \
     src/klayoutCellResolver.cpp \
+    src/layoutedit.cpp \
     src/lstreamcellreader.cpp \
     src/mainwindow.cpp \
     src/assistant/assistantmcp.cpp \

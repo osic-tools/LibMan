@@ -1,5 +1,7 @@
 #include "snapshotscene.h"
 
+#include <QCryptographicHash>
+#include <QDateTime>
 #include <QDir>
 #include <QFileInfo>
 
@@ -22,6 +24,58 @@ bool isRoomLayoutSnapshotPath(const QString &path)
         && !name.endsWith(QLatin1String(".schematic.room"))
         && !name.endsWith(QLatin1String(".symbol.room"))
         && !name.endsWith(QLatin1String(".abstract.room"));
+}
+
+namespace {
+
+bool isOasisSnapshotPath(const QString &path)
+{
+    const QString suffix = QFileInfo(path).suffix().toLower();
+    return suffix == QLatin1String("oas") || suffix == QLatin1String("oasis");
+}
+
+QString gdsSnapshotCachePath(const QString &gdsPath)
+{
+    const QFileInfo info(gdsPath);
+    const QByteArray key = info.absoluteFilePath().toUtf8() + '|'
+        + QByteArray::number(info.size()) + '|'
+        + QByteArray::number(info.lastModified().toMSecsSinceEpoch());
+    const QString hash =
+        QString::fromLatin1(QCryptographicHash::hash(key, QCryptographicHash::Md5).toHex());
+    return QDir::temp().filePath(QStringLiteral("libman-snapshot-cache/%1.layout.room").arg(hash));
+}
+
+} // namespace
+
+bool isForeignLayoutSnapshotPath(const QString &path)
+{
+    const QString suffix = QFileInfo(path).suffix().toLower();
+    return suffix == QLatin1String("gds") || suffix == QLatin1String("gds2")
+        || suffix == QLatin1String("gdsii") || isOasisSnapshotPath(path);
+}
+
+QString foreignLayoutSnapshotSkipReason(const QString &path, qint64 sizeBytes)
+{
+    if (!isForeignLayoutSnapshotPath(path)) {
+        return QString();
+    }
+    // OASIS is expanded fully in memory; GDS is stream-converted once, then memory-mapped.
+    const bool oasis = isOasisSnapshotPath(path);
+    const qint64 limit = oasis ? kMaxOasisSnapshotBytes : kMaxGdsSnapshotBytes;
+    if (sizeBytes <= limit) {
+        return QString();
+    }
+    if (!oasis && QFileInfo::exists(gdsSnapshotCachePath(path))) {
+        return QString();
+    }
+    return QStringLiteral("Layout is too large for a snapshot (%1 MB %2)\nOpen it in KLayout")
+        .arg(sizeBytes / (1024 * 1024))
+        .arg(oasis ? QStringLiteral("OASIS") : QStringLiteral("GDS"));
+}
+
+QString foreignLayoutSnapshotSkipReason(const QString &path)
+{
+    return foreignLayoutSnapshotSkipReason(path, QFileInfo(path).size());
 }
 
 QString layoutSnapshotFocusCell(bool selectingTreeCell,
@@ -73,8 +127,14 @@ QStringList layoutSubtreeLoadAttempts(const QString &requestedCell, const QStrin
 #include "database.h"
 #include "em_model_data.h"
 #include "enums.h"
+#include "gds_stream_import.h"
+#include "oas_reader.h"
 #include "room_json_io.h"
 #include "serialization.h"
+
+#include <QFile>
+#include <QMutex>
+#include <QMutexLocker>
 #endif
 
 namespace {
@@ -278,6 +338,70 @@ bool yGrowsUp(const room::CellContent &content)
                                                                           Qt::CaseInsensitive) != 0;
 }
 
+// GDS is stream-converted once per file version so huge layouts reuse the
+// memory-mapped ROOM overview path instead of building every Shape in RAM.
+QString gdsSnapshotRoomPath(const QString &gdsPath)
+{
+    const QString roomPath = gdsSnapshotCachePath(gdsPath);
+    if (QFileInfo::exists(roomPath)) {
+        return roomPath;
+    }
+    // One conversion at a time: repeated clicks must not start parallel multi-GB imports.
+    static QMutex conversionMutex;
+    QMutexLocker lock(&conversionMutex);
+    if (QFileInfo::exists(roomPath)) {
+        return roomPath;
+    }
+    if (!QDir().mkpath(QFileInfo(roomPath).absolutePath())) {
+        throw std::runtime_error("Cannot create snapshot cache directory");
+    }
+
+    const QFileInfo info(gdsPath);
+    const QString partial = roomPath + QStringLiteral(".part");
+    QFile::remove(partial);
+    const room::GdsStreamImportResult result =
+        room::importGdsStreamToRoom(gdsPath.toStdString(), partial.toStdString(),
+                                    info.completeBaseName().toStdString());
+    if (!result.errors.empty() || !QFileInfo::exists(partial)) {
+        QFile::remove(partial);
+        throw std::runtime_error(result.errors.empty() ? std::string("GDS import failed")
+                                                       : result.errors.front());
+    }
+    if (!QFile::rename(partial, roomPath)) {
+        QFile::remove(partial);
+        if (!QFileInfo::exists(roomPath)) {
+            throw std::runtime_error("Cannot write snapshot cache file");
+        }
+    }
+    return roomPath;
+}
+
+// Unreferenced cell with the largest bbox: the chip, not a stray library leaf.
+const room::Cell *topLayoutCell(const room::Lib &lib)
+{
+    if (!lib.hasIndex()) {
+        return nullptr;
+    }
+    const room::Cell *best = nullptr;
+    double bestArea = -1.0;
+    for (const std::string &name : lib.index().topCells) {
+        const room::Cell *cell = lib.findCell(name);
+        if (cell == nullptr) {
+            continue;
+        }
+        double area = 0.0;
+        const auto it = lib.index().cellBboxes.find(name);
+        if (it != lib.index().cellBboxes.end() && !it->second.empty()) {
+            area = double(it->second.urx - it->second.llx) * double(it->second.ury - it->second.lly);
+        }
+        if (area > bestArea) {
+            best = cell;
+            bestArea = area;
+        }
+    }
+    return best;
+}
+
 class SnapshotBuilder {
 public:
     explicit SnapshotBuilder(const SnapshotSymbolResolver &resolver)
@@ -292,14 +416,28 @@ public:
         // Layout snapshots decode only the focus cell (+ a few instance levels),
         // not the entire multi-GB library payload.
         room::Database db;
-        if (viewType == room::ViewType::Layout) {
+        const QString suffix = QFileInfo(path).suffix().toLower();
+        const bool isOas = suffix == QLatin1String("oas") || suffix == QLatin1String("oasis");
+        bool pickTopCell = false;
+        if (viewType == room::ViewType::Layout && isOas) {
+            room::OasReader reader(path.toStdString());
+            if (!reader.importDatabase(db, QFileInfo(path).completeBaseName().toStdString())) {
+                throw std::runtime_error(reader.errors().empty() ? std::string("OASIS import failed")
+                                                                 : reader.errors().front());
+            }
+            db.lib().setIndex(room::LibIndex::build(db.lib()));
+            pickTopCell = true;
+        } else if (viewType == room::ViewType::Layout) {
+            const QString loadPath =
+                isForeignLayoutSnapshotPath(path) ? gdsSnapshotRoomPath(path) : path;
             // LibMan cell/group name often differs from GDS tops inside *.layout.room
             // (e.g. group cmim_… vs cell TOP). Try requested → stem → primary/first.
             // Memory-mapped, budgeted BFS decode; index bboxes cover what is not decoded.
             const auto loadSubtree = [&](const QString &name) {
                 room::LayoutOverviewOptions options;
                 options.maxDepth = kMaxLayoutDepth;
-                return room::loadLayoutOverview(path.toStdString(), name.toStdString(), options);
+                return room::loadLayoutOverview(loadPath.toStdString(), name.toStdString(),
+                                                options);
             };
             std::exception_ptr lastError;
             bool loaded = false;
@@ -330,6 +468,9 @@ public:
         }
         if (cell == nullptr) {
             cell = m_lib->findCell(cellNameFromCorePath(path).toStdString());
+        }
+        if (cell == nullptr && pickTopCell) {
+            cell = topLayoutCell(*m_lib);
         }
         if (cell == nullptr && !m_lib->cells().empty()) {
             cell = &m_lib->cells().front();
@@ -783,9 +924,18 @@ SnapshotScene loadCoreSnapshot(const QString &corePath,
                 || fileName.contains(QStringLiteral(".symbol."), Qt::CaseInsensitive)
                 || fileName.contains(QStringLiteral(".layout."), Qt::CaseInsensitive)
                 || fileName.contains(QStringLiteral(".emmodel."), Qt::CaseInsensitive));
-        if (!isRoom && !isRoomJson) {
+        const bool isForeignLayout = isForeignLayoutSnapshotPath(corePath)
+            && viewTypeForSnapshot(viewName) == room::ViewType::Layout;
+        if (!isRoom && !isRoomJson && !isForeignLayout) {
             scene.message = QStringLiteral("Not a ROOM file");
             return scene;
+        }
+        if (isForeignLayout) {
+            const QString skip = foreignLayoutSnapshotSkipReason(corePath);
+            if (!skip.isEmpty()) {
+                scene.message = skip;
+                return scene;
+            }
         }
     }
 

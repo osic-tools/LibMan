@@ -16,6 +16,7 @@
 #include "tst_klayout_requests.h"
 #include "tst_oas_writer.h"
 #include "tst_snapshot_layout.h"
+#include "tst_layoutedit.h"
 #include "tst_lstream_writer.h"
 #include "tst_libfileparser.h"
 #include "tst_libdefine_utils.h"
@@ -137,6 +138,7 @@ int main(int argc, char **argv)
         ADD_TEST(KLayoutRequestsTest),
         ADD_TEST(OasWriterTest),
         ADD_TEST(SnapshotLayoutPolicyTest),
+        ADD_TEST(LayoutEditTest),
         ADD_TEST(LStreamWriterTest),
         ADD_TEST(LibFileParserTest),
         ADD_TEST(LibDefineUtilsTest),

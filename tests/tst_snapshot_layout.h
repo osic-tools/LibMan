@@ -25,6 +25,12 @@ private slots:
     void loadCoreSnapshot_layoutGroupNameMissingFallsBackToTop();
     void loadCoreSnapshot_layoutDrawsInstanceArrays();
     void loadCoreSnapshot_layoutTreeCellFramesOnlyThatCell();
+
+    void isForeignLayoutSnapshotPath_matchesGdsAndOasis();
+    void loadCoreSnapshot_gdsRootDrawsTopWithChild();
+    void loadCoreSnapshot_gdsTreeCellDrawsOnlyThatCell();
+    void loadCoreSnapshot_oasWithoutCellPicksTop();
+    void foreignLayoutSnapshotSkipReason_skipsOnlyHugeFiles();
 };
 
 #endif // TST_SNAPSHOT_LAYOUT_H

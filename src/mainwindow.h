@@ -358,6 +358,7 @@ private:
     QJsonObject                         buildPdkStateObject() const;
     QJsonObject                         buildTechInfoObject() const;
     void                                appendPythonLog(const QString &text, bool isError = false);
+    void                                echoPythonCode(const QString &code);
     void                                pushPythonHistory(const QString &code);
     bool                                recallPythonHistory(int delta);
 
@@ -630,7 +631,8 @@ private:
                                                              const QString &viewPath,
                                                              QStringList *errors = nullptr) const;
     QString                             preferredKLayoutCellForRoot(const QString &layoutPath,
-                                                                  const QString &groupName) const;
+                                                                  const QString &groupName,
+                                                                  bool allowFileScan = true) const;
     bool                                isLayoutViewTreeItem(QTreeWidgetItem *item) const;
     bool                                updateProjectFileLibraryName(const QString &oldName,
                                                                      const QString &newName);

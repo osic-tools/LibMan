@@ -51,6 +51,16 @@ QString layoutRoomPathFromEmModel(const QString &emmodelPath, QString *topCellOu
 /*! True when path is a ROOM layout suitable for emsetup/layout snapshot. */
 bool isRoomLayoutSnapshotPath(const QString &path);
 
+/*! True for GDSII/OASIS paths; the layout snapshot imports them through CommonDB. */
+bool isForeignLayoutSnapshotPath(const QString &path);
+
+constexpr qint64 kMaxGdsSnapshotBytes = 512LL * 1024 * 1024;
+constexpr qint64 kMaxOasisSnapshotBytes = 64LL * 1024 * 1024;
+
+/*! Non-empty message when a GDS/OASIS file is too large to import for a snapshot. */
+QString foreignLayoutSnapshotSkipReason(const QString &path, qint64 sizeBytes);
+QString foreignLayoutSnapshotSkipReason(const QString &path);
+
 /*!
  * Layout tree selection → focus cell name.
  * Expanded child uses \p treeCellName; view root uses \p resolvedTopCell then \p groupNameFallback.

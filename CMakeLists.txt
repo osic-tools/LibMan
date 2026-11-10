@@ -178,6 +178,7 @@ set(SOURCES
     src/klayout_tools.cpp
     src/klayout_tools.h
     src/klayoutCellResolver.cpp
+    src/layoutedit.cpp
     src/lstreamcellreader.cpp
     src/mainwindow.cpp
     src/python_console.cpp

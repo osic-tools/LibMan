@@ -37,6 +37,7 @@
 #include <QListWidgetItem>
 #include <QVBoxLayout>
 
+#include "layoutedit.h"
 #include "snapshotview.h"
 #include "snapshotscene.h"
 #include "python_console.h"
@@ -1410,7 +1411,8 @@ QString layoutFileStemHint(const QString &layoutPath)
 } // namespace
 
 QString MainWindow::preferredKLayoutCellForRoot(const QString &layoutPath,
-                                              const QString &groupName) const
+                                              const QString &groupName,
+                                              bool allowFileScan) const
 {
     const QString key = QFileInfo(layoutPath).absoluteFilePath();
     LayoutHierarchySnapshot snapshot;
@@ -1454,7 +1456,7 @@ QString MainWindow::preferredKLayoutCellForRoot(const QString &layoutPath,
         }
     }
 
-    if (!haveSnapshot) {
+    if (!haveSnapshot && allowFileScan) {
         QStringList errors;
         haveSnapshot = loadLayoutHierarchySnapshot(layoutPath, snapshot, &errors);
         Q_UNUSED(errors);
@@ -3691,6 +3693,19 @@ QJsonObject MainWindow::buildTechInfoObject() const
 #endif
     out.insert(QStringLiteral("tech_room_layers"), layerSummaries);
     if (const DoorPdkInfo *pdk = activePdk()) {
+        const QVector<TechLayer> techLayers = loadKLayoutTechLayers(pdk->tech.layers);
+        QJsonArray drawing;
+        for (const TechLayer &layer : techLayers) {
+            if (layer.purpose.compare(QLatin1String("drawing"), Qt::CaseInsensitive) == 0) {
+                drawing.append(QStringLiteral("%1 %2/%3").arg(layer.name).arg(layer.layer).arg(layer.datatype));
+            }
+        }
+        out.insert(QStringLiteral("pdk_layer_count"), techLayers.size());
+        out.insert(QStringLiteral("pdk_drawing_layers"), drawing);
+        const double dbuUm = loadKLayoutTechDbuMicrons(pdk->tech.layers);
+        if (dbuUm > 0.0) {
+            out.insert(QStringLiteral("pdk_dbu_um"), dbuUm);
+        }
         QJsonObject tech;
         tech.insert(QStringLiteral("root"), pdk->tech.root);
         tech.insert(QStringLiteral("klayout"), pdk->tech.klayout);
@@ -3955,6 +3970,116 @@ void MainWindow::registerAssistantMcpTools()
         QJsonObject schema;
         schema.insert(QStringLiteral("type"), QStringLiteral("object"));
         QJsonObject props;
+        const auto prop = [&props](const char *name, const char *type, const char *description) {
+            QJsonObject p;
+            p.insert(QStringLiteral("type"), QLatin1String(type));
+            p.insert(QStringLiteral("description"), QLatin1String(description));
+            props.insert(QLatin1String(name), p);
+        };
+        prop("layer", "string",
+             "Technology layer: name (\"Metal1\"), name.purpose (\"Metal1.drawing\") or GDS \"8/0\"");
+        prop("purpose", "string", "Layer purpose when not in layer (default: drawing)");
+        prop("width_um", "number", "Rectangle size along X in microns (w)");
+        prop("height_um", "number", "Rectangle size along Y in microns (l / h)");
+        prop("x_um", "number", "Lower-left X in microns (default 0)");
+        prop("y_um", "number", "Lower-left Y in microns (default 0)");
+        prop("cell", "string", "Target cell in the current library (default: selected cell)");
+        schema.insert(QStringLiteral("properties"), props);
+        schema.insert(QStringLiteral("required"),
+                      QJsonArray{QStringLiteral("layer"), QStringLiteral("width_um"),
+                                 QStringLiteral("height_um")});
+
+        m_assistantMcp->registerTool(
+            QStringLiteral("add_layout_rect"),
+            QStringLiteral(
+                "Add one rectangle to the cell's ROOM layout (*.layout.room). The layer is "
+                "resolved by name/purpose from the project PDK technology (KLayout *.lyp), "
+                "sizes are microns. Creates and registers the layout view when missing. "
+                "Use for “create rectangle w=2u l=4u on Metal1” — this is an edit, not auto layout."),
+            schema,
+            [this](const QJsonObject &args) {
+                const QString lib = getCurrentLibraryName();
+                QString cell = args.value(QStringLiteral("cell")).toString().trimmed();
+                if (cell.isEmpty()) {
+                    cell = getCurrentGroupName();
+                }
+                if (lib.isEmpty() || cell.isEmpty()) {
+                    return AssistantMcp::errResult(
+                        QStringLiteral("No selected library/cell — select a cell first"));
+                }
+
+                const DoorPdkInfo *pdk = activePdk();
+                const QString techDir = pdk ? pdk->tech.layers : QString();
+                const QVector<TechLayer> techLayers = loadKLayoutTechLayers(techDir);
+                TechLayer layer;
+                QString layerError;
+                if (!findTechLayer(techLayers, args.value(QStringLiteral("layer")).toString(),
+                                   args.value(QStringLiteral("purpose")).toString(), &layer,
+                                   &layerError)) {
+                    return AssistantMcp::errResult(layerError);
+                }
+
+                QString path = getViewPath(lib, cell, QStringLiteral("layout"));
+                const bool created = path.isEmpty() || !QFileInfo::exists(path);
+                if (created) {
+                    const QString libRoot = getLibraryPath(lib);
+                    if (libRoot.isEmpty()) {
+                        return AssistantMcp::errResult(QStringLiteral("Library root path unknown"));
+                    }
+                    path = QDir::toNativeSeparators(roomViewFilePath(
+                        QDir(libRoot).filePath(cell), cell, QStringLiteral("layout")));
+                } else if (QFileInfo(path).size() > 256LL * 1024 * 1024) {
+                    return AssistantMcp::errResult(
+                        QStringLiteral("Layout is too large to edit here: %1").arg(path));
+                }
+
+                const double dbuUm = loadKLayoutTechDbuMicrons(techDir);
+                const double x = args.value(QStringLiteral("x_um")).toDouble(0.0);
+                const double y = args.value(QStringLiteral("y_um")).toDouble(0.0);
+                const double w = args.value(QStringLiteral("width_um")).toDouble(0.0);
+                const double h = args.value(QStringLiteral("height_um")).toDouble(0.0);
+                QString editError;
+                LayoutRectEdit applied;
+                if (!addRectToLayoutRoom(path, cell, layer, x, y, w, h,
+                                         dbuUm > 0.0 ? 1.0 / dbuUm : 1000.0, &editError,
+                                         &applied)) {
+                    return AssistantMcp::errResult(editError);
+                }
+
+                appendPythonLog(QStringLiteral("# add_layout_rect: %1 %2/%3, (%4, %5) %6 x %7 um")
+                                    .arg(layer.fullName())
+                                    .arg(layer.layer)
+                                    .arg(layer.datatype)
+                                    .arg(x)
+                                    .arg(y)
+                                    .arg(w)
+                                    .arg(h));
+                echoPythonCode(layoutRectPythonCode(path, cell, layer, applied));
+
+                if (created && !registerCellViewAtPath(lib, cell, QStringLiteral("layout"), path)) {
+                    return AssistantMcp::errResult(
+                        QStringLiteral("Rectangle saved but view registration failed: %1").arg(path));
+                }
+                refreshSnapshot();
+
+                QJsonObject out;
+                out.insert(QStringLiteral("ok"), true);
+                out.insert(QStringLiteral("path"), path);
+                out.insert(QStringLiteral("cell"), cell);
+                out.insert(QStringLiteral("layer"), layer.fullName());
+                out.insert(QStringLiteral("gds_layer"),
+                           QStringLiteral("%1/%2").arg(layer.layer).arg(layer.datatype));
+                out.insert(QStringLiteral("box_um"),
+                           QJsonArray{x, y, x + w, y + h});
+                out.insert(QStringLiteral("created_view"), created);
+                return out;
+            });
+    }
+
+    {
+        QJsonObject schema;
+        schema.insert(QStringLiteral("type"), QStringLiteral("object"));
+        QJsonObject props;
         QJsonObject codeProp;
         codeProp.insert(QStringLiteral("type"), QStringLiteral("string"));
         props.insert(QStringLiteral("code"), codeProp);
@@ -4022,11 +4147,7 @@ void MainWindow::registerAssistantMcpTools()
                 const QString fullCode = preamble + code;
 
                 // Echo like Virtuoso CIW / Command Line (user code only; skip injected prelude).
-                const QStringList lines = code.split(QLatin1Char('\n'));
-                for (int i = 0; i < lines.size(); ++i) {
-                    appendPythonLog((i == 0 ? QStringLiteral(">>> ") : QStringLiteral("... "))
-                                    + lines.at(i));
-                }
+                echoPythonCode(code);
 
                 bool finishedOk = false;
                 bool gotFinished = false;
@@ -4069,11 +4190,19 @@ void MainWindow::registerAssistantMcpTools()
         m_assistantMcp->registerTool(
             name, description, schema,
             [this, name](const QJsonObject &args) {
-                if (!m_roomMcp) {
-                    return AssistantMcp::errResult(QStringLiteral("Room MCP client missing"));
+                // Code may edit files on disk: always show it. Other payloads stay out of Messages.
+                const QString code = args.value(QStringLiteral("code")).toString();
+                if (!code.trimmed().isEmpty()) {
+                    appendPythonLog(QStringLiteral("# %1").arg(name));
+                    echoPythonCode(code);
                 }
-                // Do not mirror MCP payloads into Messages — that duplicates Command Line.
-                return m_roomMcp->callTool(name, args);
+                const QJsonObject result =
+                    m_roomMcp ? m_roomMcp->callTool(name, args)
+                              : AssistantMcp::errResult(QStringLiteral("Room MCP client missing"));
+                if (!code.trimmed().isEmpty() && !result.value(QStringLiteral("ok")).toBool(true)) {
+                    appendPythonLog(result.value(QStringLiteral("error")).toString(), true);
+                }
+                return result;
             });
     };
 
@@ -4199,6 +4328,17 @@ void MainWindow::appendPythonLog(const QString &text, bool isError)
     m_ui->textMessages->setTextCursor(cursor);
 }
 
+/*!*******************************************************************************************************************
+ * \brief Echoes Python code into Messages like Virtuoso CIW (">>> " first line, "... " continuation).
+ **********************************************************************************************************************/
+void MainWindow::echoPythonCode(const QString &code)
+{
+    const QStringList lines = code.split(QLatin1Char('\n'));
+    for (int i = 0; i < lines.size(); ++i) {
+        appendPythonLog((i == 0 ? QStringLiteral(">>> ") : QStringLiteral("... ")) + lines.at(i));
+    }
+}
+
 void MainWindow::pushPythonHistory(const QString &code)
 {
     const QString trimmed = code.trimmed();
@@ -4268,11 +4408,7 @@ void MainWindow::runPythonCommand()
 
     pushPythonHistory(code);
 
-    // Echo like Virtuoso CIW.
-    QStringList lines = code.split(QLatin1Char('\n'));
-    for (int i = 0; i < lines.size(); ++i) {
-        appendPythonLog((i == 0 ? QStringLiteral(">>> ") : QStringLiteral("... ")) + lines.at(i));
-    }
+    echoPythonCode(code);
 
     m_ui->editPythonCommand->setEnabled(false);
     m_pythonConsole->execute(code);
@@ -4628,23 +4764,34 @@ void MainWindow::refreshSnapshot()
 
     const QString viewName = root->text(0).trimmed();
     const QString view = viewName.toLower();
-    const bool isLayout = isLayoutRoomViewName(view);
+    const int rootType = root->data(0, RoleType).toInt();
+    const bool isForeignLayout = rootType == ItemViewGds || rootType == ItemViewOas;
+    const bool isLayout = isForeignLayout || isLayoutRoomViewName(view);
     const bool isEmModel = (view == QLatin1String("emmodel"));
     const bool isEmSetup = isEmSetupViewName(view);
+    if (rootType == ItemViewLStream) {
+        m_snapshotView->clearScene(tr("Snapshot is not available for LStream (lstr) layout yet"));
+        return;
+    }
     if (view != QLatin1String("schematic") && view != QLatin1String("symbol")
         && view != QLatin1String("sch") && view != QLatin1String("sym")
         && !isLayout && !isEmModel && !isEmSetup) {
         m_snapshotView->clearScene(
-            tr("Snapshot is available for schematic, symbol, layout, and emmodel (ROOM layout)"));
+            tr("Snapshot is available for schematic, symbol, layout (ROOM, GDS, OASIS), and emmodel"));
         return;
     }
 
     QString viewPath;
-    if (root->data(0, RoleType).toInt() == ItemViewCore) {
+    if (rootType == ItemViewCore) {
         viewPath = root->data(0, RoleCorePath).toString();
-    } else if (root->data(0, RoleType).toInt() == ItemViewEmSetup) {
+    } else if (rootType == ItemViewEmSetup) {
         viewPath = root->data(0, RoleEmSetupPath).toString();
-    } else {
+    } else if (rootType == ItemViewGds) {
+        viewPath = root->data(0, RoleGdsPath).toString();
+    } else if (rootType == ItemViewOas) {
+        viewPath = root->data(0, RoleOasPath).toString();
+    }
+    if (viewPath.isEmpty() && rootType != ItemViewCore && rootType != ItemViewEmSetup) {
         viewPath = getViewPath(getCurrentLibraryName(), getCurrentGroupName(), viewName);
     }
 
@@ -4654,7 +4801,9 @@ void MainWindow::refreshSnapshot()
 
     // Layout ROOM may be huge: decode one cell (+ shallow hierarchy) off the UI thread.
     // Do not capture MainWindow into the worker (resize during load must stay race-free).
-    const auto startAsyncLayoutSnapshot = [this](const QString &path, const QString &cellName) {
+    // Empty cellName on GDS/OASIS: the top cell is resolved in the worker (hierarchy scan).
+    const auto startAsyncLayoutSnapshot = [this](const QString &path, const QString &cellName,
+                                                 const QString &groupHint = QString()) {
         m_snapshotView->clearScene(tr("Loading snapshot…"));
         const quint64 requestId = ++m_snapshotRequestId;
         auto *watcher = new QFutureWatcher<SnapshotScene>(this);
@@ -4676,8 +4825,21 @@ void MainWindow::refreshSnapshot()
                     m_snapshotView->setScene(scene);
                 });
         // Empty symbol resolver: layout draw path never needs MainWindow/UI.
-        watcher->setFuture(QtConcurrent::run([path, cellName]() {
-            return loadCoreSnapshot(path, QStringLiteral("layout"), {}, cellName);
+        watcher->setFuture(QtConcurrent::run([path, cellName, groupHint]() {
+            QString focus = cellName;
+            if (focus.isEmpty() && isForeignLayoutSnapshotPath(path)) {
+                SnapshotScene skipped;
+                skipped.message = foreignLayoutSnapshotSkipReason(path);
+                if (!skipped.message.isEmpty()) {
+                    return skipped;
+                }
+                LayoutHierarchySnapshot hierarchy;
+                if (loadLayoutHierarchySnapshot(path, hierarchy)) {
+                    focus = resolveKLayoutRootCell(hierarchy, groupHint,
+                                                   layoutSnapshotPathStem(path));
+                }
+            }
+            return loadCoreSnapshot(path, QStringLiteral("layout"), {}, focus);
         }));
     };
 
@@ -4734,6 +4896,14 @@ void MainWindow::refreshSnapshot()
             }
         }
         const QString groupName = getCurrentGroupName();
+        if (isForeignLayout) {
+            // Never scan a GDS/OASIS hierarchy on the UI thread; use the tree cache or the worker.
+            const QString cachedTop = selectingCell
+                ? QString()
+                : preferredKLayoutCellForRoot(viewPath, groupName, false);
+            startAsyncLayoutSnapshot(viewPath, selectingCell ? treeCell : cachedTop, groupName);
+            return;
+        }
         const QString resolvedTop =
             selectingCell ? QString() : preferredKLayoutCellForRoot(viewPath, groupName);
         startAsyncLayoutSnapshot(

@@ -49,6 +49,7 @@ add_executable(tst_libman_gui
     tst_mainwindow_loaders.h
     tst_oas_writer.h
     tst_snapshot_layout.h
+    tst_layoutedit.h
     tst_toolmanager.h
     tst_coverage_expansion.h
     tst_coverage_80.h
@@ -64,6 +65,7 @@ add_executable(tst_libman_gui
     tst_mainwindow_loaders.cpp
     tst_oas_writer.cpp
     tst_snapshot_layout.cpp
+    tst_layoutedit.cpp
     tst_toolmanager.cpp
     tst_coverage_expansion.cpp
     tst_coverage_80.cpp
@@ -98,6 +100,7 @@ add_executable(tst_libman_gui
     ${LIBMAN_ROOT}/src/klayout_tools.cpp
     ${LIBMAN_ROOT}/src/klayout_tools.h
     ${LIBMAN_ROOT}/src/klayoutCellResolver.cpp
+    ${LIBMAN_ROOT}/src/layoutedit.cpp
     ${LIBMAN_ROOT}/src/lstreamcellreader.cpp
 
     ${LIBMAN_ROOT}/gds/gdsreader.cpp

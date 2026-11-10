@@ -2,8 +2,10 @@
 #define MAINWINDOW_TEST_HOOKS_H
 
 #include "mainwindow.h"
+#include "ui_mainwindow.h"
 
 #include <QListWidget>
+#include <QTextEdit>
 #include <QMap>
 #include <QStringList>
 #include <QTreeWidget>
@@ -113,6 +115,24 @@ public:
     static bool filterTreeItem(MainWindow *w, QTreeWidgetItem *item, const QString &filter)
     {
         return w->filterTreeItem(item, filter);
+    }
+
+    static AssistantMcp *assistantMcp(MainWindow *w)
+    {
+        return w->m_assistantMcp;
+    }
+
+    /*! Swaps the Room MCP client (nullptr keeps tests off the external Python server). */
+    static RoomMcpClient *swapRoomMcp(MainWindow *w, RoomMcpClient *client)
+    {
+        RoomMcpClient *previous = w->m_roomMcp;
+        w->m_roomMcp = client;
+        return previous;
+    }
+
+    static QString messagesText(MainWindow *w)
+    {
+        return w->m_ui->textMessages->toPlainText();
     }
 };
 
